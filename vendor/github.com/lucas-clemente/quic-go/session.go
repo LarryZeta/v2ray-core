@@ -1,6 +1,7 @@
 package quic
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -21,7 +22,7 @@ import (
 )
 
 type unpacker interface {
-	Unpack(headerBinary []byte, hdr *wire.Header, data []byte) (*unpackedPacket, error)
+	Unpack(headerBinary []byte, hdr *wire.ExtendedHeader, data []byte) (*unpackedPacket, error)
 }
 
 type streamGetter interface {
@@ -52,7 +53,7 @@ type cryptoStreamHandler interface {
 
 type receivedPacket struct {
 	remoteAddr net.Addr
-	header     *wire.Header
+	hdr        *wire.Header
 	data       []byte
 	rcvTime    time.Time
 }
@@ -113,10 +114,7 @@ type session struct {
 
 	receivedFirstPacket              bool // since packet numbers start at 0, we can't use largestRcvdPacketNumber != 0 for this
 	receivedFirstForwardSecurePacket bool
-	lastRcvdPacketNumber             protocol.PacketNumber
-	// Used to calculate the next packet number from the truncated wire
-	// representation, and sent back in public reset packets
-	largestRcvdPacketNumber protocol.PacketNumber
+	largestRcvdPacketNumber          protocol.PacketNumber // used to calculate the next packet number
 
 	sessionCreationTime     time.Time
 	lastNetworkActivityTime time.Time
@@ -289,7 +287,7 @@ var newClientSession = func(
 
 func (s *session) preSetup() {
 	s.rttStats = &congestion.RTTStats{}
-	s.sentPacketHandler = ackhandler.NewSentPacketHandler(s.rttStats, s.logger, s.version)
+	s.sentPacketHandler = ackhandler.NewSentPacketHandler(s.rttStats, s.logger)
 	s.receivedPacketHandler = ackhandler.NewReceivedPacketHandler(s.rttStats, s.logger, s.version)
 	s.connFlowController = flowcontrol.NewConnectionFlowController(
 		protocol.InitialMaxData,
@@ -374,7 +372,7 @@ runLoop:
 			}
 			// This is a bit unclean, but works properly, since the packet always
 			// begins with the public header and we never copy it.
-			putPacketBuffer(&p.header.Raw)
+			// TODO: putPacketBuffer(&p.extHdr.Raw)
 		case <-s.handshakeCompleteChan:
 			s.handleHandshakeComplete()
 		}
@@ -479,24 +477,41 @@ func (s *session) handleHandshakeComplete() {
 }
 
 func (s *session) handlePacketImpl(p *receivedPacket) error {
-	hdr := p.header
 	// The server can change the source connection ID with the first Handshake packet.
 	// After this, all packets with a different source connection have to be ignored.
-	if s.receivedFirstPacket && hdr.IsLongHeader && !hdr.SrcConnectionID.Equal(s.destConnID) {
-		s.logger.Debugf("Dropping packet with unexpected source connection ID: %s (expected %s)", p.header.SrcConnectionID, s.destConnID)
+	if s.receivedFirstPacket && p.hdr.IsLongHeader && !p.hdr.SrcConnectionID.Equal(s.destConnID) {
+		s.logger.Debugf("Dropping packet with unexpected source connection ID: %s (expected %s)", p.hdr.SrcConnectionID, s.destConnID)
 		return nil
 	}
 
-	p.rcvTime = time.Now()
+	data := p.data
+	r := bytes.NewReader(data)
+	hdr, err := p.hdr.ParseExtended(r, s.version)
+	if err != nil {
+		return fmt.Errorf("error parsing extended header: %s", err)
+	}
+	hdr.Raw = data[:len(data)-r.Len()]
+	data = data[len(data)-r.Len():]
+
+	if hdr.IsLongHeader {
+		if hdr.Length < protocol.ByteCount(hdr.PacketNumberLen) {
+			return fmt.Errorf("packet length (%d bytes) shorter than packet number (%d bytes)", hdr.Length, hdr.PacketNumberLen)
+		}
+		if protocol.ByteCount(len(data))+protocol.ByteCount(hdr.PacketNumberLen) < hdr.Length {
+			return fmt.Errorf("packet length (%d bytes) is smaller than the expected length (%d bytes)", len(data)+int(hdr.PacketNumberLen), hdr.Length)
+		}
+		data = data[:int(hdr.Length)-int(hdr.PacketNumberLen)]
+		// TODO(#1312): implement parsing of compound packets
+	}
+
 	// Calculate packet number
 	hdr.PacketNumber = protocol.InferPacketNumber(
 		hdr.PacketNumberLen,
 		s.largestRcvdPacketNumber,
 		hdr.PacketNumber,
-		s.version,
 	)
 
-	packet, err := s.unpacker.Unpack(hdr.Raw, hdr, p.data)
+	packet, err := s.unpacker.Unpack(hdr.Raw, hdr, data)
 	if s.logger.Debug() {
 		if err != nil {
 			s.logger.Debugf("<- Reading packet 0x%x (%d bytes) for connection %s", hdr.PacketNumber, len(p.data)+len(hdr.Raw), hdr.DestConnectionID)
@@ -530,7 +545,6 @@ func (s *session) handlePacketImpl(p *receivedPacket) error {
 		}
 	}
 
-	s.lastRcvdPacketNumber = hdr.PacketNumber
 	// Only do this after decrypting, so we are sure the packet is not attacker-controlled
 	s.largestRcvdPacketNumber = utils.MaxPacketNumber(s.largestRcvdPacketNumber, hdr.PacketNumber)
 
@@ -543,10 +557,10 @@ func (s *session) handlePacketImpl(p *receivedPacket) error {
 		}
 	}
 
-	return s.handleFrames(packet.frames, packet.encryptionLevel)
+	return s.handleFrames(packet.frames, hdr.PacketNumber, packet.encryptionLevel)
 }
 
-func (s *session) handleFrames(fs []wire.Frame, encLevel protocol.EncryptionLevel) error {
+func (s *session) handleFrames(fs []wire.Frame, pn protocol.PacketNumber, encLevel protocol.EncryptionLevel) error {
 	for _, ff := range fs {
 		var err error
 		wire.LogFrame(s.logger, ff, false)
@@ -556,7 +570,7 @@ func (s *session) handleFrames(fs []wire.Frame, encLevel protocol.EncryptionLeve
 		case *wire.StreamFrame:
 			err = s.handleStreamFrame(frame, encLevel)
 		case *wire.AckFrame:
-			err = s.handleAckFrame(frame, encLevel)
+			err = s.handleAckFrame(frame, pn, encLevel)
 		case *wire.ConnectionCloseFrame:
 			s.closeRemote(qerr.Error(frame.ErrorCode, frame.ReasonPhrase))
 		case *wire.ResetStreamFrame:
@@ -702,8 +716,8 @@ func (s *session) handlePathChallengeFrame(frame *wire.PathChallengeFrame) {
 	s.queueControlFrame(&wire.PathResponseFrame{Data: frame.Data})
 }
 
-func (s *session) handleAckFrame(frame *wire.AckFrame, encLevel protocol.EncryptionLevel) error {
-	if err := s.sentPacketHandler.ReceivedAck(frame, s.lastRcvdPacketNumber, encLevel, s.lastNetworkActivityTime); err != nil {
+func (s *session) handleAckFrame(frame *wire.AckFrame, pn protocol.PacketNumber, encLevel protocol.EncryptionLevel) error {
+	if err := s.sentPacketHandler.ReceivedAck(frame, pn, encLevel, s.lastNetworkActivityTime); err != nil {
 		return err
 	}
 	s.receivedPacketHandler.IgnoreBelow(s.sentPacketHandler.GetLowestPacketNotConfirmedAcked())
@@ -889,12 +903,7 @@ func (s *session) maybeSendRetransmission() (bool, error) {
 		break
 	}
 
-	if retransmitPacket.EncryptionLevel != protocol.Encryption1RTT {
-		s.logger.Debugf("Dequeueing handshake retransmission for packet 0x%x", retransmitPacket.PacketNumber)
-	} else {
-		s.logger.Debugf("Dequeueing retransmission for packet 0x%x", retransmitPacket.PacketNumber)
-	}
-
+	s.logger.Debugf("Dequeueing retransmission for packet 0x%x", retransmitPacket.PacketNumber)
 	packets, err := s.packer.PackRetransmission(retransmitPacket)
 	if err != nil {
 		return false, err
@@ -1065,14 +1074,14 @@ func (s *session) scheduleSending() {
 
 func (s *session) tryQueueingUndecryptablePacket(p *receivedPacket) {
 	if s.handshakeComplete {
-		s.logger.Debugf("Received undecryptable packet from %s after the handshake: %#v, %d bytes data", p.remoteAddr.String(), p.header, len(p.data))
+		s.logger.Debugf("Received undecryptable packet from %s after the handshake (%d bytes)", p.remoteAddr.String(), len(p.data))
 		return
 	}
 	if len(s.undecryptablePackets)+1 > protocol.MaxUndecryptablePackets {
-		s.logger.Infof("Dropping undecrytable packet 0x%x (undecryptable packet queue full)", p.header.PacketNumber)
+		s.logger.Infof("Dropping undecrytable packet (%d bytes). Undecryptable packet queue full.", len(p.data))
 		return
 	}
-	s.logger.Infof("Queueing packet 0x%x for later decryption", p.header.PacketNumber)
+	s.logger.Infof("Queueing packet (%d bytes) for later decryption", len(p.data))
 	s.undecryptablePackets = append(s.undecryptablePackets, p)
 }
 
