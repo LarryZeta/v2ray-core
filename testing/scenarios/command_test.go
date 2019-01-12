@@ -2,12 +2,12 @@ package scenarios
 
 import (
 	"context"
-	"crypto/rand"
 	"fmt"
 	"io"
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"google.golang.org/grpc"
 
 	"v2ray.com/core"
@@ -18,7 +18,6 @@ import (
 	"v2ray.com/core/app/router"
 	"v2ray.com/core/app/stats"
 	statscmd "v2ray.com/core/app/stats/command"
-	"v2ray.com/core/common/compare"
 	"v2ray.com/core/common/net"
 	"v2ray.com/core/common/protocol"
 	"v2ray.com/core/common/serial"
@@ -120,8 +119,8 @@ func TestCommanderRemoveHandler(t *testing.T) {
 		response := make([]byte, 1024)
 		nBytes, err = conn.Read(response)
 		assert(err, IsNil)
-		if err := compare.BytesEqualWithDetail(response[:nBytes], xor([]byte(payload))); err != nil {
-			t.Fatal(err)
+		if r := cmp.Diff(response[:nBytes], xor([]byte(payload))); r != "" {
+			t.Fatal(r)
 		}
 	}
 
@@ -499,23 +498,8 @@ func TestCommanderStats(t *testing.T) {
 	}
 	defer CloseAllServers(servers)
 
-	conn, err := net.DialTCP("tcp", nil, &net.TCPAddr{
-		IP:   []byte{127, 0, 0, 1},
-		Port: int(clientPort),
-	})
-	assert(err, IsNil)
-	defer conn.Close() // nolint: errcheck
-
-	payload := make([]byte, 10240*1024)
-	rand.Read(payload)
-
-	nBytes, err := conn.Write([]byte(payload))
-	assert(err, IsNil)
-	assert(nBytes, Equals, len(payload))
-
-	response := readFrom(conn, time.Second*20, 10240*1024)
-	if err := compare.BytesEqualWithDetail(response, xor([]byte(payload))); err != nil {
-		t.Fatal("failed to read response: ", err)
+	if err := testTCPConn(clientPort, 10240*1024, time.Second*20)(); err != nil {
+		t.Fatal(err)
 	}
 
 	cmdConn, err := grpc.Dial(fmt.Sprintf("127.0.0.1:%d", cmdPort), grpc.WithInsecure(), grpc.WithBlock())

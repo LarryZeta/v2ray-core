@@ -48,6 +48,15 @@ func ConnectionOutputMulti(reader buf.Reader) ConnectionOption {
 	}
 }
 
+func ConnectionOutputMultiUDP(reader buf.Reader) ConnectionOption {
+	return func(c *connection) {
+		c.reader = &buf.BufferedReader{
+			Reader:  reader,
+			Spliter: buf.SplitFirstBytes,
+		}
+	}
+}
+
 func ConnectionOnClose(n io.Closer) ConnectionOption {
 	return func(c *connection) {
 		c.onClose = n
@@ -115,7 +124,7 @@ func (c *connection) WriteMultiBuffer(mb buf.MultiBuffer) error {
 // Close implements net.Conn.Close().
 func (c *connection) Close() error {
 	common.Must(c.done.Close())
-	common.Close(c.reader)
+	common.Interrupt(c.reader)
 	common.Close(c.writer)
 	if c.onClose != nil {
 		return c.onClose.Close()
