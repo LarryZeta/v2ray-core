@@ -38,7 +38,7 @@ echo ${SIGN_KEY_PASS} | gpg --passphrase-fd 0 --batch --import /v2/build/sign_ke
 curl -L -o /v2/build/releases https://api.github.com/repos/v2ray/v2ray-core/releases
 
 GO_INSTALL=golang.tar.gz
-curl -L -o ${GO_INSTALL} https://storage.googleapis.com/golang/go1.11.2.linux-amd64.tar.gz
+curl -L -o ${GO_INSTALL} https://storage.googleapis.com/golang/go1.11.5.linux-amd64.tar.gz
 tar -C /usr/local -xzf ${GO_INSTALL}
 export PATH=$PATH:/usr/local/go/bin
 
@@ -73,12 +73,6 @@ popd
 # Take a snapshot of all required source code
 pushd $GOPATH/src
 
-# Flatten vendor directories
-cp -r v2ray.com/core/vendor/github.com/ .
-rm -rf v2ray.com/core/vendor/
-cp -r github.com/lucas-clemente/quic-go/vendor/github.com/ .
-rm -rf github.com/lucas-clemente/quic-go/vendor/
-
 # Create zip file for all sources
 zip -9 -r /v2/build/src_all.zip * -x '*.git*'
 popd
@@ -96,8 +90,9 @@ RELEASE_ID=$(curl --data "${JSON_DATA}" -H "Authorization: token ${GITHUB_TOKEN}
 function uploadfile() {
   FILE=$1
   CTYPE=$(file -b --mime-type $FILE)
-  curl -H "Authorization: token ${GITHUB_TOKEN}" -H "Content-Type: ${CTYPE}" --data-binary @$FILE "https://uploads.github.com/repos/v2ray/v2ray-core/releases/${RELEASE_ID}/assets?name=$(basename $FILE)"
 
+  sleep 1
+  curl -H "Authorization: token ${GITHUB_TOKEN}" -H "Content-Type: ${CTYPE}" --data-binary @$FILE "https://uploads.github.com/repos/v2ray/v2ray-core/releases/${RELEASE_ID}/assets?name=$(basename $FILE)"
   sleep 1
 }
 
@@ -168,6 +163,47 @@ git config user.email "admin@v2ray.com"
 
 git commit -am "update to version $VERN"
 git push  --quiet "https://${GITHUB_TOKEN}@github.com/v2ray/homebrew-v2ray" master:master
+
+echo "Updating dist"
+
+cd $GOPATH/src/v2ray.com/
+mkdir dist
+cd dist
+
+git init
+git config user.name "Darien Raymond"
+git config user.email "admin@v2ray.com"
+
+cp ${ART_ROOT}/v2ray-macos.zip .
+cp ${ART_ROOT}/v2ray-windows-64.zip .
+cp ${ART_ROOT}/v2ray-windows-32.zip .
+cp ${ART_ROOT}/v2ray-linux-64.zip .
+cp ${ART_ROOT}/v2ray-linux-32.zip .
+cp ${ART_ROOT}/v2ray-linux-arm.zip .
+cp ${ART_ROOT}/v2ray-linux-arm64.zip .
+cp ${ART_ROOT}/v2ray-linux-mips64.zip .
+cp ${ART_ROOT}/v2ray-linux-mips64le.zip .
+cp ${ART_ROOT}/v2ray-linux-mips.zip .
+cp ${ART_ROOT}/v2ray-linux-mipsle.zip .
+cp ${ART_ROOT}/v2ray-linux-ppc64.zip .
+cp ${ART_ROOT}/v2ray-linux-ppc64le.zip .
+cp ${ART_ROOT}/v2ray-linux-s390x.zip .
+cp ${ART_ROOT}/v2ray-freebsd-64.zip .
+cp ${ART_ROOT}/v2ray-freebsd-32.zip .
+cp ${ART_ROOT}/v2ray-openbsd-64.zip .
+cp ${ART_ROOT}/v2ray-openbsd-32.zip .
+cp ${ART_ROOT}/v2ray-dragonfly-64.zip .
+cp /v2/build/src_all.zip .
+cp "$GOPATH/src/v2ray.com/core/release/install-release.sh" ./install.sh
+
+sed -i "s/^NEW_VER=\"\"$/NEW_VER=\"${RELEASE_TAG}\"/" install.sh
+sed -i 's/^DIST_SRC=".*"$/DIST_SRC="jsdelivr"/' install.sh
+
+git add .
+git commit -m "Version ${RELEASE_TAG}"
+git tag -a "${RELEASE_TAG}" -m "Version ${RELEASE_TAG}"
+git remote add origin "https://${GITHUB_TOKEN}@github.com/v2ray/dist"
+git push -u --force --follow-tags origin master
 
 fi
 
